@@ -51,7 +51,10 @@ func NewSSETransport(ctx context.Context, client *http.Client, log abstractlogge
 }
 
 // Subscribe initiates a GraphQL subscription over SSE.
-// Each call creates a new HTTP request (no multiplexing).
+// Each call creates a new HTTP request (no multiplexing). After connecting,
+// interrupted streams are re-subscribed with bounded backoff. This can replay
+// initial subscription data; it does not resume missed events. An explicit
+// complete/error event, clean EOF, or cancellation ends the subscription.
 //
 // The HTTP method is determined by opts.SSEMethod:
 //   - SSEMethodPOST: POST with JSON body (graphql-sse spec)
@@ -92,8 +95,7 @@ func (t *SSETransport) Subscribe(ctx context.Context, req *common.Request, opts 
 
 	httpReq = httpReq.WithContext(requestCtx)
 
-	// Execute request
-	resp, err := t.client.Do(httpReq)
+	resp, err := t.connect(httpReq, opts.Endpoint)
 	if err != nil {
 		cleanup()
 		t.log.Error(
@@ -101,27 +103,6 @@ func (t *SSETransport) Subscribe(ctx context.Context, req *common.Request, opts 
 			abstractlogger.String("endpoint", opts.Endpoint),
 			abstractlogger.Error(err),
 		)
-
-		return nil, fmt.Errorf("execute request: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		cleanup()
-		resp.Body.Close()
-		t.log.Error(
-			"sseTransport.Subscribe",
-			abstractlogger.String("endpoint", opts.Endpoint),
-			abstractlogger.Int("status", resp.StatusCode),
-		)
-		// Match WS connection failures so callers can propagate the upstream status.
-		return nil, ErrFailedSubscriptionConnection{URL: opts.Endpoint, StatusCode: resp.StatusCode}
-	}
-
-	// Verify content type (should be text/event-stream)
-	if err := t.validateContentType(resp); err != nil {
-		cleanup()
-		resp.Body.Close()
-
 		return nil, err
 	}
 
@@ -141,6 +122,19 @@ func (t *SSETransport) Subscribe(ctx context.Context, req *common.Request, opts 
 		t.removeConn(conn)
 	})
 
+	conn.ctx = requestCtx
+	conn.reconnect = func() (*http.Response, error) {
+		retry := httpReq.Clone(requestCtx)
+		if httpReq.GetBody != nil {
+			var err error
+			retry.Body, err = httpReq.GetBody()
+			if err != nil {
+				return nil, fmt.Errorf("recreate request body: %w", err)
+			}
+		}
+		return t.connect(retry, opts.Endpoint)
+	}
+
 	t.mu.Lock()
 	t.conns[conn] = struct{}{}
 	t.mu.Unlock()
@@ -154,6 +148,25 @@ func (t *SSETransport) Subscribe(ctx context.Context, req *common.Request, opts 
 	}
 
 	return cancelFn, nil
+}
+
+// connect validates every response, including re-subscription attempts.
+func (t *SSETransport) connect(req *http.Request, endpoint string) (*http.Response, error) {
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("execute request: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		// Match WS connection failures so callers can propagate the upstream status.
+		return nil, ErrFailedSubscriptionConnection{URL: endpoint, StatusCode: resp.StatusCode}
+	}
+	// Verify content type (should be text/event-stream)
+	if err := t.validateContentType(resp); err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	return resp, nil
 }
 
 // buildPOSTRequest creates a POST request with JSON body (graphql-sse spec).
