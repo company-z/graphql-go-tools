@@ -2,13 +2,25 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/r3labs/sse/v2"
 
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/datasource/graphql_datasource/subscriptionclient/common"
+)
+
+const (
+	sseMaxConsecutiveFailures = 10
+	sseInitialRetryDelay      = 250 * time.Millisecond
+	sseMaxRetryDelay          = 5 * time.Second
+	sseHealthyStreamDuration  = time.Second
 )
 
 var (
@@ -16,12 +28,15 @@ var (
 	headerEvent = []byte("event:")
 )
 
-// sseConnection handles a single SSE subscription stream.
+// sseConnection owns a subscription across successive SSE response streams.
 type sseConnection struct {
-	resp    *http.Response
-	handler common.Handler
-	closed  atomic.Bool
-	onClose func() // Callback function to notify parent transport that the connection was closed.
+	mu        sync.Mutex // Protects response replacement against concurrent close.
+	ctx       context.Context
+	reconnect func() (*http.Response, error)
+	resp      *http.Response
+	handler   common.Handler
+	closed    atomic.Bool
+	onClose   func() // Callback function to notify parent transport that the connection was closed.
 }
 
 func newSSEConnection(resp *http.Response, handler common.Handler, onClose func()) *sseConnection {
@@ -38,40 +53,88 @@ func newSSEConnection(resp *http.Response, handler common.Handler, onClose func(
 func (c *sseConnection) readLoop() {
 	defer c.cleanup()
 
-	reader := sse.NewEventStreamReader(c.resp.Body, 1<<16) // 64KB
-
+	failures := 0
 	for {
-		if c.closed.Load() {
+		started := time.Now()
+		delivered, err := c.readStream()
+		if err == nil || c.closed.Load() || (c.ctx != nil && c.ctx.Err() != nil) {
 			return
 		}
-
-		eventBytes, err := reader.ReadEvent()
-		if err != nil {
-			if c.closed.Load() {
-				return
-			}
+		// A clean EOF and protocol errors remain terminal. Only interrupted reads retry.
+		if c.reconnect == nil || errors.Is(err, io.EOF) {
 			c.sendError(err)
 			return
 		}
+		// Healthy rotations reconnect immediately; short-lived failures share the
+		// same bounded budget as failed HTTP reconnect attempts.
+		if delivered && time.Since(started) >= sseHealthyStreamDuration {
+			failures = 0
+		} else {
+			failures++
+		}
+		c.resp.Body.Close()
+		for {
+			if failures >= sseMaxConsecutiveFailures {
+				c.sendError(err)
+				return
+			}
+			if failures > 0 {
+				delay := min(sseInitialRetryDelay<<(failures-1), sseMaxRetryDelay)
+				timer := time.NewTimer(delay)
+				select {
+				case <-c.ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+			if c.closed.Load() || c.ctx.Err() != nil {
+				return
+			}
+			var resp *http.Response
+			resp, err = c.reconnect()
+			if err != nil {
+				failures++
+				continue
+			}
+			c.mu.Lock()
+			if c.closed.Load() || c.ctx.Err() != nil {
+				c.mu.Unlock()
+				resp.Body.Close()
+				return
+			}
+			c.resp = resp
+			c.mu.Unlock()
+			break
+		}
+	}
+}
 
-		// Parse the raw event bytes into event type and data
+// readStream returns transport read errors to the reconnect loop. Protocol-level
+// terminal messages are delivered directly and must never trigger a replay.
+func (c *sseConnection) readStream() (delivered bool, err error) {
+	reader := sse.NewEventStreamReader(c.resp.Body, 1<<16) // 64KB
+	for {
+		if c.closed.Load() {
+			return delivered, nil
+		}
+		eventBytes, err := reader.ReadEvent()
+		if err != nil {
+			return delivered, err
+		}
 		eventType, data := c.parseEventBytes(eventBytes)
-
-		// Skip empty events (e.g., keep-alive comments)
 		if eventType == "" && data == nil {
 			continue
 		}
-
 		msg := c.parseEvent(eventType, data)
-
-		if c.closed.Load() {
-			return
+		if c.closed.Load() || (c.ctx != nil && c.ctx.Err() != nil) {
+			return delivered, nil
 		}
 		c.handler(msg)
-
 		if msg.Type.IsTerminal() {
-			return
+			return delivered, nil
 		}
+		delivered = true
 	}
 }
 
@@ -155,15 +218,14 @@ func (c *sseConnection) parseEvent(eventType string, data []byte) *common.Messag
 }
 
 func (c *sseConnection) sendError(err error) {
-	if c.closed.Load() {
+	if c.closed.Load() || (c.ctx != nil && c.ctx.Err() != nil) {
 		return
 	}
 	c.handler(&common.Message{Type: common.MessageTypeConnectionError, Err: err})
 }
 
 func (c *sseConnection) cleanup() {
-	c.closed.Store(true)
-	c.resp.Body.Close()
+	c.closeConn()
 
 	if c.onClose != nil {
 		c.onClose()
@@ -176,5 +238,7 @@ func (c *sseConnection) closeConn() {
 		return
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.resp.Body.Close()
 }
