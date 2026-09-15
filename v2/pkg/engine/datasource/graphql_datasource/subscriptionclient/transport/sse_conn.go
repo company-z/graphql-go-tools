@@ -1,11 +1,13 @@
 package transport
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -21,6 +23,13 @@ const (
 	sseInitialRetryDelay      = 250 * time.Millisecond
 	sseMaxRetryDelay          = 5 * time.Second
 	sseHealthyStreamDuration  = time.Second
+
+	// sseMaxEventSize bounds a single SSE event read from a subgraph. Upstream caps
+	// this at 64 KiB, which is smaller than the batched payloads our subgraphs
+	// emit routinely (event feeds and filtered token tables run to hundreds of
+	// KiB per event). The engine this replaced had no cap and subgraphs are
+	// trusted internal services, so reads stay unbounded.
+	sseMaxEventSize = math.MaxInt
 )
 
 var (
@@ -60,8 +69,10 @@ func (c *sseConnection) readLoop() {
 		if err == nil || c.closed.Load() || (c.ctx != nil && c.ctx.Err() != nil) {
 			return
 		}
-		// A clean EOF and protocol errors remain terminal. Only interrupted reads retry.
-		if c.reconnect == nil || errors.Is(err, io.EOF) {
+		// A clean EOF and protocol errors remain terminal. Only interrupted reads
+		// retry. An oversized event is not an interruption: replaying the
+		// subscription would hit the same event again and loop forever.
+		if c.reconnect == nil || errors.Is(err, io.EOF) || errors.Is(err, bufio.ErrTooLong) {
 			c.sendError(err)
 			return
 		}
@@ -113,7 +124,7 @@ func (c *sseConnection) readLoop() {
 // readStream returns transport read errors to the reconnect loop. Protocol-level
 // terminal messages are delivered directly and must never trigger a replay.
 func (c *sseConnection) readStream() (delivered bool, err error) {
-	reader := sse.NewEventStreamReader(c.resp.Body, 1<<16) // 64KB
+	reader := sse.NewEventStreamReader(c.resp.Body, sseMaxEventSize)
 	for {
 		if c.closed.Load() {
 			return delivered, nil
