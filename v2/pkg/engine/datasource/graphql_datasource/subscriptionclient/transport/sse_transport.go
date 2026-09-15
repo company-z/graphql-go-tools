@@ -54,7 +54,10 @@ func NewSSETransport(ctx context.Context, client *http.Client, log abstractlogge
 }
 
 // Subscribe initiates a GraphQL subscription over SSE.
-// Each call creates a new HTTP request (no multiplexing).
+// Each call creates a new HTTP request (no multiplexing). After connecting,
+// interrupted streams are re-subscribed with bounded backoff. This can replay
+// initial subscription data; it does not resume missed events. An explicit
+// complete/error event, clean EOF, or cancellation ends the subscription.
 //
 // The HTTP method is determined by opts.SSEMethod:
 //   - SSEMethodPOST: POST with JSON body (graphql-sse spec)
@@ -87,40 +90,20 @@ func (t *SSETransport) Subscribe(ctx context.Context, req *common.Request, opts 
 	//   - t.ctx cancel: transport-wide shutdown, tears down all in-flight requests.
 	//   - ctx cancel: individual subscription cancelled by the caller.
 	requestCtx, requestCancel := context.WithCancel(context.WithoutCancel(ctx))
-	context.AfterFunc(t.ctx, requestCancel)
-	context.AfterFunc(ctx, requestCancel)
+	stopTransport := context.AfterFunc(t.ctx, requestCancel)
+	stopSubscription := context.AfterFunc(ctx, requestCancel)
+	cleanup := func() {
+		stopTransport()
+		stopSubscription()
+		requestCancel()
+	}
 
 	httpReq = httpReq.WithContext(requestCtx)
 
-	// Execute request
-	resp, err := t.client.Do(httpReq)
+	resp, err := t.connect(httpReq)
 	if err != nil {
-		requestCancel()
-		t.log.Error("sseTransport.Subscribe",
-			abstractlogger.String("endpoint", opts.Endpoint),
-			abstractlogger.Error(err),
-		)
-		return nil, fmt.Errorf("execute request: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		requestCancel()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
-		resp.Body.Close()
-		t.log.Error("sseTransport.Subscribe",
-			abstractlogger.String("endpoint", opts.Endpoint),
-			abstractlogger.Int("status", resp.StatusCode),
-		)
-		if len(body) > 0 {
-			return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
-		}
-		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-
-	// Verify content type (should be text/event-stream)
-	if err := t.validateContentType(resp); err != nil {
-		requestCancel()
-		resp.Body.Close()
+		cleanup()
+		t.log.Error("sseTransport.Subscribe", abstractlogger.String("endpoint", opts.Endpoint), abstractlogger.Error(err))
 		return nil, err
 	}
 
@@ -134,7 +117,23 @@ func (t *SSETransport) Subscribe(ctx context.Context, req *common.Request, opts 
 	// When a connection's read loop terminates (terminal message, EOF, or read error),
 	// the onClose callback immediately removes it from the transport's connection map.
 	// This prevents naturally-completed streams from leaking until the transport is closed.
-	conn = newSSEConnection(resp, handler, func() { t.removeConn(conn) })
+	conn = newSSEConnection(resp, handler, func() {
+		cleanup()
+		t.removeConn(conn)
+	})
+
+	conn.ctx = requestCtx
+	conn.reconnect = func() (*http.Response, error) {
+		retry := httpReq.Clone(requestCtx)
+		if httpReq.GetBody != nil {
+			var err error
+			retry.Body, err = httpReq.GetBody()
+			if err != nil {
+				return nil, fmt.Errorf("recreate request body: %w", err)
+			}
+		}
+		return t.connect(retry)
+	}
 
 	t.mu.Lock()
 	t.conns[conn] = struct{}{}
@@ -149,6 +148,27 @@ func (t *SSETransport) Subscribe(ctx context.Context, req *common.Request, opts 
 	}
 
 	return cancelFn, nil
+}
+
+// connect validates every response, including re-subscription attempts.
+func (t *SSETransport) connect(req *http.Request) (*http.Response, error) {
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("execute request: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+		if len(body) > 0 {
+			return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, body)
+		}
+		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+	if err := t.validateContentType(resp); err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	return resp, nil
 }
 
 // buildPOSTRequest creates a POST request with JSON body (graphql-sse spec).
